@@ -70,6 +70,7 @@ type builder struct {
 	bootFS    BootFS
 
 	loDevice        string
+	partNodes       []string
 	bootPart        string
 	rootPart        string
 	cryptPart       string
@@ -281,16 +282,24 @@ func (b *builder) makeImg(ctx context.Context) error {
 
 func (b *builder) mountImg(ctx context.Context) error {
 	logrus.Infof("mounting raw image")
-	o, _, err := exec.RunOut(ctx, "losetup", "--show", "-f", b.diskRaw)
+	// -P has the loop driver scan the partition table itself, rather than
+	// mapping the partitions through kpartx, which needs device-mapper: not
+	// every kernel a container runs on has dm_mod loaded, and a container
+	// cannot load it.
+	o, _, err := exec.RunOut(ctx, "losetup", "--show", "-f", "-P", b.diskRaw)
 	if err != nil {
 		return err
 	}
 	b.loDevice = strings.TrimSuffix(o, "\n")
-	if err := exec.Run(ctx, "kpartx", "-a", b.loDevice); err != nil {
+	if b.bootPart, err = b.partNode(ctx, 1); err != nil {
 		return err
 	}
-	b.bootPart = fmt.Sprintf("/dev/mapper/%sp1", filepath.Base(b.loDevice))
-	b.rootPart = ifElse(b.splitBoot, fmt.Sprintf("/dev/mapper/%sp2", filepath.Base(b.loDevice)), b.bootPart)
+	b.rootPart = b.bootPart
+	if b.splitBoot {
+		if b.rootPart, err = b.partNode(ctx, 2); err != nil {
+			return err
+		}
+	}
 	if b.isLuksEnabled() {
 		logrus.Infof("encrypting root partition")
 		f, err := os.CreateTemp("", "key")
@@ -362,9 +371,45 @@ func (b *builder) unmountImg(ctx context.Context) error {
 	}
 	return multierr.Combine(
 		merr,
-		exec.Run(ctx, "kpartx", "-d", b.loDevice),
 		exec.Run(ctx, "losetup", "-d", b.loDevice),
+		b.removePartNodes(),
 	)
+}
+
+// partNode returns the device node of partition n of the loop device,
+// creating it when missing. In a container /dev is populated once, at start,
+// and nothing like udev adds the nodes for partitions the kernel finds later,
+// so it is made here from the numbers the kernel publishes in sysfs.
+func (b *builder) partNode(ctx context.Context, n int) (string, error) {
+	name := fmt.Sprintf("%sp%d", filepath.Base(b.loDevice), n)
+	dev := filepath.Join("/dev", name)
+	if _, err := os.Stat(dev); err == nil {
+		return dev, nil
+	}
+	nums, err := os.ReadFile(filepath.Join("/sys/class/block", name, "dev"))
+	if err != nil {
+		return "", fmt.Errorf("partition %d of %s not found (is loop partition scanning available?): %w", n, b.loDevice, err)
+	}
+	major, minor, ok := strings.Cut(strings.TrimSpace(string(nums)), ":")
+	if !ok {
+		return "", fmt.Errorf("unexpected device number %q for %s", nums, name)
+	}
+	if err := exec.Run(ctx, "mknod", dev, "b", major, minor); err != nil {
+		return "", err
+	}
+	b.partNodes = append(b.partNodes, dev)
+	return dev, nil
+}
+
+// removePartNodes removes the nodes partNode created, which would otherwise
+// point at the wrong partitions once the loop device is reused.
+func (b *builder) removePartNodes() error {
+	var merr error
+	for _, v := range b.partNodes {
+		merr = multierr.Append(merr, os.Remove(v))
+	}
+	b.partNodes = nil
+	return merr
 }
 
 func (b *builder) copyRootFS(ctx context.Context) error {
@@ -509,7 +554,7 @@ func block(path string, size uint64) error {
 
 func (b *builder) checkDependencies() error {
 	var merr error
-	deps := []string{"mount", "blkid", "tar", "losetup", "parted", "kpartx", "qemu-img", "dd", "mkfs.ext4", "cryptsetup"}
+	deps := []string{"mount", "blkid", "tar", "losetup", "mknod", "parted", "qemu-img", "dd", "mkfs.ext4", "cryptsetup"}
 	if _, ok := b.bootloader.(*syslinux); ok {
 		deps = append(deps, "extlinux")
 	}
